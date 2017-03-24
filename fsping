@@ -1,0 +1,177 @@
+#!/usr/bin/env python
+
+import time
+import os
+import uuid
+import socket
+import sys
+import simplejson as json
+import string
+import random
+import hashlib
+from optparse import OptionParser
+
+# add the stale entry of seen into the dict
+
+def client(opts):
+
+  SUM = 0
+  seen = {}
+
+  ACKFILE = "%s.ack" % opts.prefix
+  SYNFILE = "%s.syn" % opts.prefix
+
+  print 'FSPING client', opts.prefix, opts.size, 'bytes of data', opts.count, 'pings'
+
+  if opts.verbose: print 'Checking for stale ping files...',
+  try:
+    os.stat(ACKFILE)
+    os.stat(SYNFILE)
+    assert False, "%s and %s already exist. Restart the target." % (ACKFILE, SYNFILE)
+  except OSError:
+    pass
+  if opts.verbose: print 'done.'
+
+  # generate random text of length opts.size
+  if opts.verbose: print 'Generating random string with length %d bytes' % opts.size
+  char_set = string.ascii_uppercase + string.ascii_lowercase + string.digits
+  data = ''.join(random.choice(char_set) for _ in xrange(opts.size))
+
+  pings = []
+  seen = {}
+  for i in xrange(1, opts.count + 1):
+
+    content = {
+      'data': data,
+      'timestamp': time.time(),
+      'from': socket.gethostname(),
+      'seq': i,
+      'count': opts.count,
+    }
+
+    blob = json.dumps(content)
+    
+    # write the syn file 
+    f1 = open(SYNFILE, 'w')
+    f1.write(blob)
+    f1.close()
+    syntime = time.time()
+    print len(blob), 'bytes to', SYNFILE,
+ 
+    # wait for the ack 
+    while True:
+      try:
+        f2 = open(ACKFILE, 'r')
+        content = f2.read()
+        size = len(content)
+        c2 = float(content)
+        f2.close()
+        already = seen[c2]
+      except IOError: # file does not exist yet
+        pass
+      except ValueError: # file has invalid content
+        pass
+      except KeyError:
+        seen[c2] = True
+        acktime = time.time()
+        print size, 'bytes from', ACKFILE,
+        break
+    delay = (acktime - syntime) * 1000.0
+    print "seq=%d time=%.2f ms" % (i, delay)
+
+    pings.append(delay)
+    SUM += delay
+    time.sleep(1)
+
+  print '--- %s fsping statistics ---' % opts.prefix
+  print '%d writes sent, %d received' % (opts.count, opts.count)
+  print 'rtt min/avg/max = %.3f/%.3f/%.3f ms' % (min(pings), SUM/opts.count, max(pings))
+
+  if opts.verbose: print 'Cleaning up ping files with prefix %s...' % opts.prefix,
+  os.unlink(ACKFILE)
+  os.unlink(SYNFILE)
+  if opts.verbose: print 'done'
+
+def server(opts):
+
+  ACKFILE = "%s.ack" % opts.prefix
+  SYNFILE = "%s.syn" % opts.prefix
+
+  if opts.verbose: print 'Removing stale ping files %s %s...' % (SYNFILE, ACKFILE),
+  try:
+    os.remove(SYNFILE)
+  except OSError:
+    pass # file didn't exist
+  try:
+    os.remove(ACKFILE)
+  except OSError:
+    pass # file didn't exist
+  if opts.verbose: print 'done.\n'
+
+  print 'FSPING reflector', os.getcwd(), 'prefix', opts.prefix
+#  print '## Tip: Now, from another machine do:'
+#  print '##'
+#  print '##  cd %s' % os.getcwd()
+#  print '##  fsping --prefix %s\n' % opts.prefix
+
+  i = 1
+
+  while True:
+    while True:
+      # wait until the SYNFILE first exists
+      while not os.path.exists(SYNFILE):
+        continue
+      try:
+        f1 = open(SYNFILE, 'r')
+        blob = f1.read()
+        size = len(blob)
+        content = json.loads(blob)
+        f1.close()
+        assert content['seq'] == i, 'Unexpected seq %d' % content['seq']
+      except ValueError: # invalid json
+        break
+      except AssertionError:
+        break
+
+      print '%d bytes from %s' % (size, SYNFILE),
+      f2 = open(ACKFILE, 'w')
+      data = str(time.time())
+      size = len(data)
+      f2.write(data)
+      f2.close()
+      print '%d bytes to %s seq=%d' % (size, ACKFILE, i)
+
+      if content['seq'] == content['count']:
+        print '--- All done ---'
+        sys.exit(0)
+
+      i += 1
+
+ 
+if __name__ == "__main__":
+  # get the local hostname, to use as a default file prefix
+  HOSTNAME = socket.gethostname().split('.')[0]
+
+  parser = OptionParser(description='fsping can be used to measure the consistency/latency of a clustered filesystem. To run, start this program in server mode on Node A (e.g. ./fsping --server), then run from Node B in the same directory (e.g. ./fsping --prefix nodeA)')
+  parser.add_option("--server", action="store_true", default=False,
+                  help="Act as a server -- a ping reflector, in other words. (default=False)")
+  parser.add_option("--client", action="store_true", default=True,
+                  help="Act as a client -- a ping emitter, to say it another way. (default=True)")
+  parser.add_option("--prefix", action="store", type="string", default=HOSTNAME,
+                  help="Act as a client -- a ping sender, to say it another way. (default=%s)" % HOSTNAME)
+  parser.add_option("--count", action="store", type="int", default=10,
+                  help="Stop after sending this many echo requests. (default=10)")
+  parser.add_option("--size", action="store", type="int", default=1024,
+                  help="Write this much random data in the echo requests. (default=1024)")
+  parser.add_option("--multifile", action="store_true", default=False,
+                  help="Send each each request to a unique file. (default=False)")
+  parser.add_option("--verbose", action="store_true", help="Be verbose", default=False)
+  (options, args) = parser.parse_args()
+
+  if options.server:
+    options.client = False
+    server(options)
+  elif options.client:
+    client(options)
+
+  sys.exit(0)
